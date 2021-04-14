@@ -1,7 +1,6 @@
 # Kodi Media Center language file
-# Addon Name: ECB TV
+# Addon Name: Pyrollbar
 # Addon id: script.module.pyrollbar
-# Addon Provider: Leopold
 msgid ""
 msgstr ""
 "Project-Id-Version: \n"
