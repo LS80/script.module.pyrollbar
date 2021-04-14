@@ -4,6 +4,14 @@ import copy
 import os
 import sys
 from array import array
+import json
+
+try:
+    # Python 3
+    from collections.abc import Mapping
+except ImportError:
+    # Python 2.7
+    from collections import Mapping
 
 import six
 from six.moves import urllib
@@ -15,7 +23,7 @@ binary_type = six.binary_type
 integer_types = six.integer_types
 number_types = integer_types + (float, )
 string_types = six.string_types
-sequence_types = (collections.Mapping, list, tuple, set, frozenset, array, collections.deque)
+sequence_types = (Mapping, list, tuple, set, frozenset, array, collections.deque)
 
 urlparse = urllib.parse.urlparse
 urlsplit = urllib.parse.urlsplit
@@ -158,7 +166,7 @@ def is_builtin_type(obj):
 
 
 # http://www.xormedia.com/recursively-merge-dictionaries-in-python.html
-def dict_merge(a, b):
+def dict_merge(a, b, silence_errors=False):
     """
     Recursively merges dict's. not just simple a['key'] = b['key'], if
     both a and bhave a key who's value is a dict then dict_merge is called
@@ -171,11 +179,14 @@ def dict_merge(a, b):
     result = a
     for k, v in b.items():
         if k in result and isinstance(result[k], dict):
-            result[k] = dict_merge(result[k], v)
+            result[k] = dict_merge(result[k], v, silence_errors=silence_errors)
         else:
             try:
                 result[k] = copy.deepcopy(v)
             except:
+                if not silence_errors:
+                    raise six.reraise(*sys.exc_info())
+
                 result[k] = '<Uncopyable obj:(%s)>' % (v,)
 
     return result
@@ -205,3 +216,16 @@ def unencodable_object_label(data):
 def undecodable_object_label(data):
     return '<Undecodable type:(%s) base64:(%s)>' % (type(data).__name__,
                                                     base64.b64encode(data).decode('ascii'))
+
+try:
+    from django.utils.functional import SimpleLazyObject
+except ImportError:
+    SimpleLazyObject = None
+
+
+def defaultJSONEncode(o):
+    if SimpleLazyObject and isinstance(o, SimpleLazyObject):
+        if not o._wrapped:
+            o._setup()
+        return o._wrapped
+    return repr(o) + " is not JSON serializable"

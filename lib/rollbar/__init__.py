@@ -18,13 +18,15 @@ import traceback
 import types
 import uuid
 import wsgiref.util
+import warnings
 
 import requests
 import six
 
-from rollbar.lib import dict_merge, parse_qs, text, transport, urljoin, iteritems
+from rollbar.lib import events, filters, dict_merge, parse_qs, text, transport, urljoin, iteritems, defaultJSONEncode
 
-__version__ = '0.13.17'
+
+__version__ = '0.15.2'
 __log_name__ = 'rollbar'
 log = logging.getLogger(__log_name__)
 
@@ -61,7 +63,7 @@ else:
     del ImproperlyConfigured
 
 try:
-    from werkzeug.wrappers import Request as WerkzeugRequest
+    from werkzeug.wrappers import BaseRequest as WerkzeugRequest
 except (ImportError, SyntaxError):
     WerkzeugRequest = None
 
@@ -81,6 +83,11 @@ except ImportError:
     BottleRequest = None
 
 try:
+    from sanic.request import Request as SanicRequest
+except ImportError:
+    SanicRequest = None
+
+try:
     from google.appengine.api.urlfetch import fetch as AppEngineFetch
 except ImportError:
     AppEngineFetch = None
@@ -92,10 +99,8 @@ def passthrough_decorator(func):
     return wrap
 
 try:
-    from tornado.gen import coroutine as tornado_coroutine
     from tornado.httpclient import AsyncHTTPClient as TornadoAsyncHTTPClient
 except ImportError:
-    tornado_coroutine = passthrough_decorator
     TornadoAsyncHTTPClient = None
 
 try:
@@ -126,6 +131,11 @@ try:
 
 except ImportError:
     treq = None
+
+try:
+    from falcon import Request as FalconRequest
+except ImportError:
+    FalconRequest = None
 
 
 def get_request():
@@ -187,6 +197,7 @@ agent_log = None
 VERSION = __version__
 DEFAULT_ENDPOINT = 'https://api.rollbar.com/api/1/'
 DEFAULT_TIMEOUT = 3
+ANONYMIZE = 'anonymize'
 
 DEFAULT_LOCALS_SIZES = {
     'maxlevel': 5,
@@ -229,6 +240,7 @@ SETTINGS = {
         'accessToken',
         'auth',
         'authentication',
+        'authorization',
     ],
     'url_fields': ['url', 'link', 'href'],
     'notifier': {
@@ -241,23 +253,33 @@ SETTINGS = {
         'safe_repr': True,
         'scrub_varargs': True,
         'sizes': DEFAULT_LOCALS_SIZES,
+        'safelisted_types': [],
         'whitelisted_types': []
     },
     'verify_https': True,
     'shortener_keys': [],
     'suppress_reinit_warning': False,
+    'capture_email': False,
+    'capture_username': False,
+    'capture_ip': True,
+    'log_all_rate_limited_items': True,
+    'http_proxy': None,
+    'http_proxy_user': None,
+    'http_proxy_password': None,
+    'include_request_body': False,
+    'request_pool_connections': None,
+    'request_pool_maxsize': None,
+    'request_max_retries': None,
 }
 
 _CURRENT_LAMBDA_CONTEXT = None
+_LAST_RESPONSE_STATUS = None
 
 # Set in init()
 _transforms = []
 _serialize_transform = None
 
 _initialized = False
-
-# Do not call repr() on these types while gathering local variables
-blacklisted_local_types = []
 
 from rollbar.lib.transforms.scrub_redact import REDACT_REF
 
@@ -271,7 +293,7 @@ from rollbar.lib.transforms.shortener import ShortenerTransform
 
 ## public api
 
-def init(access_token, environment='production', **kw):
+def init(access_token, environment='production', scrub_fields=None, url_fields=None, **kw):
     """
     Saves configuration variables in this module's SETTINGS.
 
@@ -285,6 +307,13 @@ def init(access_token, environment='production', **kw):
     """
     global SETTINGS, agent_log, _initialized, _transforms, _serialize_transform, _threads
 
+    if scrub_fields is not None:
+       SETTINGS['scrub_fields'] = list(scrub_fields)
+    if url_fields is not None:
+       SETTINGS['url_fields'] = list(url_fields)
+
+    # Merge the extra config settings into SETTINGS
+    SETTINGS = dict_merge(SETTINGS, kw)
     if _initialized:
         # NOTE: Temp solution to not being able to re-init.
         # New versions of pyrollbar will support re-initialization
@@ -295,15 +324,17 @@ def init(access_token, environment='production', **kw):
 
     SETTINGS['access_token'] = access_token
     SETTINGS['environment'] = environment
-
-    # Merge the extra config settings into SETTINGS
-    SETTINGS = dict_merge(SETTINGS, kw)
+    _configure_transport(**SETTINGS)
 
     if SETTINGS.get('allow_logging_basic_config'):
         logging.basicConfig()
 
     if SETTINGS.get('handler') == 'agent':
         agent_log = _create_agent_log()
+
+    if not SETTINGS['locals']['safelisted_types'] and SETTINGS['locals']['whitelisted_types']:
+        warnings.warn('whitelisted_types deprecated use safelisted_types instead', DeprecationWarning)
+        SETTINGS['locals']['safelisted_types'] = SETTINGS['locals']['whitelisted_types']
 
     # We will perform these transforms in order:
     # 1. Serialize the payload to be all python built-in objects
@@ -312,7 +343,7 @@ def init(access_token, environment='production', **kw):
     # 4. Optional - If local variable gathering is enabled, transform the
     #       trace frame values using the ShortReprTransform.
     _serialize_transform = SerializableTransform(safe_repr=SETTINGS['locals']['safe_repr'],
-                                                 whitelist_types=SETTINGS['locals']['whitelisted_types'])
+                                                 safelist_types=SETTINGS['locals']['safelisted_types'])
     _transforms = [
         ScrubRedactTransform(),
         _serialize_transform,
@@ -342,10 +373,25 @@ def init(access_token, environment='production', **kw):
                                    keys=shortener_keys,
                                    **SETTINGS['locals']['sizes'])
     _transforms.append(shortener)
-
     _threads = queue.Queue()
+    events.reset()
+    filters.add_builtin_filters(SETTINGS)
 
     _initialized = True
+
+
+def _configure_transport(**kw):
+    configuration = _requests_configuration(**kw)
+    transport.configure_pool(**configuration)
+
+
+def _requests_configuration(**kw):
+    keys = {
+        'request_pool_connections': 'pool_connections',
+        'request_pool_maxsize': 'pool_maxsize',
+        'request_max_retries': 'max_retries',
+    }
+    return {keys[k]: kw.get(k, None) for k in keys}
 
 
 def lambda_function(f):
@@ -372,7 +418,7 @@ def report_exc_info(exc_info=None, request=None, extra_data=None, payload_data=N
     Reports an exception to Rollbar, using exc_info (from calling sys.exc_info())
 
     exc_info: optional, should be the result of calling sys.exc_info(). If omitted, sys.exc_info() will be called here.
-    request: optional, a WebOb or Werkzeug-based request object.
+    request: optional, a WebOb, Werkzeug-based or Sanic request object.
     extra_data: optional, will be included in the 'custom' section of the payload
     payload_data: optional, dict that will override values in the final payload
                   (e.g. 'level' or 'fingerprint')
@@ -413,7 +459,7 @@ def report_message(message, level='error', request=None, extra_data=None, payloa
 
 def send_payload(payload, access_token):
     """
-    Sends a payload object, (the result of calling _build_payload()).
+    Sends a payload object, (the result of calling _build_payload() + _serialize_payload()).
     Uses the configured handler from SETTINGS['handler']
 
     Available handlers:
@@ -422,31 +468,39 @@ def send_payload(payload, access_token):
     - 'agent': writes to a log file to be processed by rollbar-agent
     - 'tornado': calls _send_payload_tornado() (which makes an async HTTP request using tornado's AsyncHTTPClient)
     - 'gae': calls _send_payload_appengine() (which makes a blocking call to Google App Engine)
-    - 'twisted': calls _send_payload_twisted() (which makes an async HTTP reqeust using Twisted and Treq)
+    - 'twisted': calls _send_payload_twisted() (which makes an async HTTP request using Twisted and Treq)
     """
+    payload = events.on_payload(payload)
+    if payload is False:
+        return
+
     handler = SETTINGS.get('handler')
+    if handler == 'twisted':
+        payload['data']['framework'] = 'twisted'
+
+    payload_str = _serialize_payload(payload)
     if handler == 'blocking':
-        _send_payload(payload, access_token)
+        _send_payload(payload_str, access_token)
     elif handler == 'agent':
-        agent_log.error(payload)
+        agent_log.error(payload_str)
     elif handler == 'tornado':
         if TornadoAsyncHTTPClient is None:
             log.error('Unable to find tornado')
             return
-        _send_payload_tornado(payload, access_token)
+        _send_payload_tornado(payload_str, access_token)
     elif handler == 'gae':
         if AppEngineFetch is None:
             log.error('Unable to find AppEngine URLFetch module')
             return
-        _send_payload_appengine(payload, access_token)
+        _send_payload_appengine(payload_str, access_token)
     elif handler == 'twisted':
         if treq is None:
             log.error('Unable to find Treq')
             return
-        _send_payload_twisted(payload, access_token)
+        _send_payload_twisted(payload_str, access_token)
     else:
         # default to 'thread'
-        thread = threading.Thread(target=_send_payload, args=(payload, access_token))
+        thread = threading.Thread(target=_send_payload, args=(payload_str, access_token))
         _threads.put(thread)
         thread.start()
 
@@ -601,22 +655,27 @@ def _report_exc_info(exc_info, request, extra_data, payload_data, level=None):
     """
     Called by report_exc_info() wrapper
     """
-    # check if exception is marked ignored
-    cls, exc, trace = exc_info
-    if getattr(exc, '_rollbar_ignore', False) or _is_ignored(exc):
-        return
 
     if not _check_config():
         return
 
+    filtered_level = _filtered_level(exc_info[1])
+    if level is None:
+        level = filtered_level
+
+    filtered_exc_info = events.on_exception_info(exc_info,
+                                                 request=request,
+                                                 extra_data=extra_data,
+                                                 payload_data=payload_data,
+                                                 level=level)
+
+    if filtered_exc_info is False:
+        return
+
+    cls, exc, trace = filtered_exc_info
+
     data = _build_base_data(request)
-
-    filtered_level = _filtered_level(exc)
-    if filtered_level:
-        data['level'] = filtered_level
-
-    # explicitly override the level with provided level
-    if level:
+    if level is not None:
         data['level'] = level
 
     # walk the trace chain to collect cause and context exceptions
@@ -627,7 +686,7 @@ def _report_exc_info(exc_info, request, extra_data, payload_data, level=None):
         data['body'] = {
             'trace_chain': trace_chain
         }
-        if payload_data and payload_data['body'] and payload_data['body']['trace']:
+        if payload_data and ('body' in payload_data) and ('trace' in payload_data['body']):
             extra_trace_data = payload_data['body']['trace']
             del payload_data['body']['trace']
     else:
@@ -640,21 +699,22 @@ def _report_exc_info(exc_info, request, extra_data, payload_data, level=None):
         if not isinstance(extra_data, dict):
             extra_data = {'value': extra_data}
         if extra_trace_data:
-            extra_data = dict_merge(extra_data, extra_trace_data)
+            extra_data = dict_merge(extra_data, extra_trace_data, silence_errors=True)
         data['custom'] = extra_data
     if extra_trace_data and not extra_data:
         data['custom'] = extra_trace_data
 
+    request = _get_actual_request(request)
     _add_request_data(data, request)
     _add_person_data(data, request)
     _add_lambda_context_data(data)
     data['server'] = _build_server_data()
 
     if payload_data:
-        data = dict_merge(data, payload_data)
+        data = dict_merge(data, payload_data, silence_errors=True)
 
     payload = _build_payload(data)
-    send_payload(payload, data.get('access_token'))
+    send_payload(payload, payload.get('access_token'))
 
     return data['uuid']
 
@@ -662,11 +722,16 @@ def _report_exc_info(exc_info, request, extra_data, payload_data, level=None):
 def _walk_trace_chain(cls, exc, trace):
     trace_chain = [_trace_data(cls, exc, trace)]
 
+    seen_exceptions = {exc}
+
     while True:
         exc = getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
         if not exc:
             break
         trace_chain.append(_trace_data(type(exc), exc, getattr(exc, '__traceback__', None)))
+        if exc in seen_exceptions:
+            break
+        seen_exceptions.add(exc)
 
     return trace_chain
 
@@ -697,12 +762,21 @@ def _report_message(message, level, request, extra_data, payload_data):
     if not _check_config():
         return
 
+    filtered_message = events.on_message(message,
+                                         request=request,
+                                         extra_data=extra_data,
+                                         payload_data=payload_data,
+                                         level=level)
+
+    if filtered_message is False:
+        return
+
     data = _build_base_data(request, level=level)
 
     # message
     data['body'] = {
         'message': {
-            'body': message
+            'body': filtered_message
         }
     }
 
@@ -710,16 +784,17 @@ def _report_message(message, level, request, extra_data, payload_data):
         extra_data = extra_data
         data['body']['message'].update(extra_data)
 
+    request = _get_actual_request(request)
     _add_request_data(data, request)
     _add_person_data(data, request)
     _add_lambda_context_data(data)
     data['server'] = _build_server_data()
 
     if payload_data:
-        data = dict_merge(data, payload_data)
+        data = dict_merge(data, payload_data, silence_errors=True)
 
     payload = _build_payload(data)
-    send_payload(payload, data.get('access_token'))
+    send_payload(payload, payload.get('access_token'))
 
     return data['uuid']
 
@@ -767,6 +842,10 @@ def _add_person_data(data, request):
         log.exception("Exception while building person data for Rollbar payload: %r", e)
     else:
         if person_data:
+            if not SETTINGS['capture_username'] and 'username' in person_data:
+                person_data['username'] = None
+            if not SETTINGS['capture_email'] and 'email' in person_data:
+                person_data['email'] = None
             data['person'] = person_data
 
 
@@ -778,11 +857,7 @@ def _build_person_data(request):
     """
     if hasattr(request, 'rollbar_person'):
         rollbar_person_prop = request.rollbar_person
-        try:
-            person = rollbar_person_prop()
-        except TypeError:
-            person = rollbar_person_prop
-
+        person = rollbar_person_prop() if callable(rollbar_person_prop) else rollbar_person_prop
         if person and isinstance(person, dict):
             return person
         else:
@@ -790,11 +865,7 @@ def _build_person_data(request):
 
     if hasattr(request, 'user'):
         user_prop = request.user
-        try:
-            user = user_prop()
-        except TypeError:
-            user = user_prop
-
+        user = user_prop() if callable(user_prop) else user_prop
         if not user:
             return None
         elif isinstance(user, dict):
@@ -808,19 +879,17 @@ def _build_person_data(request):
 
             # id is required, so only include username/email if we have an id
             if retval.get('id'):
+                username = getattr(user, 'username', None)
+                email = getattr(user, 'email', None)
                 retval.update({
-                    'username': getattr(user, 'username', None),
-                    'email': getattr(user, 'email', None)
+                    'username': username,
+                    'email': email
                 })
             return retval
 
     if hasattr(request, 'user_id'):
         user_id_prop = request.user_id
-        try:
-            user_id = user_id_prop()
-        except TypeError:
-            user_id = user_id_prop
-
+        user_id = user_id_prop() if callable(user_id_prop) else user_id_prop
         if not user_id:
             return None
         return {'id': text(user_id)}
@@ -919,7 +988,10 @@ def _add_locals_data(trace_data, exc_info):
         if keywordspec:
             cur_frame['keywordspec'] = keywordspec
         if _locals:
-            cur_frame['locals'] = dict((k, _serialize_frame_data(v)) for k, v in iteritems(_locals))
+            try:
+                cur_frame['locals'] = dict((k, _serialize_frame_data(v)) for k, v in iteritems(_locals))
+            except Exception:
+                log.exception('Error while serializing frame data.')
 
         frame_num += 1
 
@@ -950,7 +1022,7 @@ def _add_lambda_context_data(data):
             }
         }
         if 'custom' in data:
-            data['custom'] = dict_merge(data['custom'], lambda_data)
+            data['custom'] = dict_merge(data['custom'], lambda_data, silence_errors=True)
         else:
             data['custom'] = lambda_data
     except Exception as e:
@@ -969,6 +1041,7 @@ def _add_request_data(data, request):
         log.exception("Exception while building request_data for Rollbar payload: %r", e)
     else:
         if request_data:
+            _filter_ip(request_data, SETTINGS['capture_ip'])
             data['request'] = request_data
 
 
@@ -980,6 +1053,16 @@ def _check_add_locals(frame, frame_num, total_frames):
     # Include any frame locals that came from a file in the project's root
     return any(((frame_num == total_frames - 1),
                 ('root' in SETTINGS and (frame.get('filename') or '').lower().startswith((SETTINGS['root'] or '').lower()))))
+
+
+def _get_actual_request(request):
+    if WerkzeugLocalProxy and isinstance(request, WerkzeugLocalProxy):
+        try:
+            actual_request = request._get_current_object()
+        except RuntimeError:
+            return None
+        return actual_request
+    return request
 
 
 def _build_request_data(request):
@@ -1004,13 +1087,6 @@ def _build_request_data(request):
     if WerkzeugRequest and isinstance(request, WerkzeugRequest):
         return _build_werkzeug_request_data(request)
 
-    if WerkzeugLocalProxy and isinstance(request, WerkzeugLocalProxy):
-        try:
-            actual_request = request._get_current_object()
-        except RuntimeError:
-            return None
-        return _build_werkzeug_request_data(actual_request)
-
     # tornado
     if TornadoRequest and isinstance(request, TornadoRequest):
         return _build_tornado_request_data(request)
@@ -1018,6 +1094,14 @@ def _build_request_data(request):
     # bottle
     if BottleRequest and isinstance(request, BottleRequest):
         return _build_bottle_request_data(request)
+
+    # Sanic
+    if SanicRequest and isinstance(request, SanicRequest):
+        return _build_sanic_request_data(request)
+
+    # falcon
+    if FalconRequest and isinstance(request, FalconRequest):
+        return _build_falcon_request_data(request)
 
     # Plain wsgi (should be last)
     if isinstance(request, dict) and 'wsgi.version' in request:
@@ -1065,15 +1149,26 @@ def _extract_wsgi_headers(items):
 
 
 def _build_django_request_data(request):
+    try:
+        url = request.get_raw_uri()
+    except AttributeError:
+        url = request.build_absolute_uri()
+
     request_data = {
-        'url': request.build_absolute_uri(),
+        'url': url,
         'method': request.method,
         'GET': dict(request.GET),
         'POST': dict(request.POST),
-        'user_ip': _wsgi_extract_user_ip(request.environ),
+        'user_ip': _wsgi_extract_user_ip(request.META),
     }
 
-    request_data['headers'] = _extract_wsgi_headers(request.environ.items())
+    if SETTINGS['include_request_body']:
+        try:
+            request_data['body'] = request.body
+        except:
+            pass
+
+    request_data['headers'] = _extract_wsgi_headers(request.META.items())
 
     return request_data
 
@@ -1086,7 +1181,7 @@ def _build_werkzeug_request_data(request):
         'user_ip': _extract_user_ip(request),
         'headers': dict(request.headers),
         'method': request.method,
-        'files_keys': request.files.keys(),
+        'files_keys': list(request.files.keys()),
     }
 
     try:
@@ -1132,6 +1227,39 @@ def _build_bottle_request_data(request):
     return request_data
 
 
+def _build_sanic_request_data(request):
+    request_data = {
+        'url': request.url,
+        'user_ip': request.remote_addr,
+        'headers': request.headers,
+        'method': request.method,
+        'GET': dict(request.args)
+    }
+
+    if request.json:
+        try:
+            request_data['body'] = request.json
+        except:
+            pass
+    else:
+        request_data['POST'] = request.form
+
+    return request_data
+
+
+def _build_falcon_request_data(request):
+    request_data = {
+        'url': request.url,
+        'user_ip': _wsgi_extract_user_ip(request.env),
+        'headers': dict(request.headers),
+        'method': request.method,
+        'GET': dict(request.params),
+        'context': dict(request.context),
+    }
+
+    return request_data
+
+
 def _build_wsgi_request_data(request):
     request_data = {
         'url': wsgiref.util.request_uri(request),
@@ -1157,6 +1285,34 @@ def _build_wsgi_request_data(request):
         input.seek(pos, 0)
 
     return request_data
+
+
+def _filter_ip(request_data, capture_ip):
+    if 'user_ip' not in request_data or capture_ip == True:
+        return
+
+    current_ip = request_data['user_ip']
+    if not current_ip:
+        return
+
+    new_ip = current_ip
+    if not capture_ip:
+        new_ip = None
+    elif capture_ip == ANONYMIZE:
+        try:
+            if '.' in current_ip:
+                new_ip = '.'.join(current_ip.split('.')[0:3]) + '.0'
+            elif ':' in current_ip:
+                parts = current_ip.split(':')
+                if len(parts) > 2:
+                    terminal = '0000:0000:0000:0000:0000'
+                    new_ip = ':'.join(parts[0:3] + [terminal])
+            else:
+                new_ip = None
+        except:
+            new_ip = None
+
+    request_data['user_ip'] = new_ip
 
 
 def _build_server_data():
@@ -1201,12 +1357,16 @@ def _build_payload(data):
         'data': data
     }
 
-    return json.dumps(payload)
+    return payload
 
 
-def _send_payload(payload, access_token):
+def _serialize_payload(payload):
+    return json.dumps(payload, default=defaultJSONEncode)
+
+
+def _send_payload(payload_str, access_token):
     try:
-        _post_api('item/', payload, access_token=access_token)
+        _post_api('item/', payload_str, access_token=access_token)
     except Exception as e:
         log.exception('Exception while posting item %r', e)
     try:
@@ -1216,14 +1376,14 @@ def _send_payload(payload, access_token):
         pass
 
 
-def _send_payload_appengine(payload, access_token):
+def _send_payload_appengine(payload_str, access_token):
     try:
-        _post_api_appengine('item/', payload, access_token=access_token)
+        _post_api_appengine('item/', payload_str, access_token=access_token)
     except Exception as e:
         log.exception('Exception while posting item %r', e)
 
 
-def _post_api_appengine(path, payload, access_token=None):
+def _post_api_appengine(path, payload_str, access_token=None):
     headers = {'Content-Type': 'application/json'}
 
     if access_token is not None:
@@ -1232,16 +1392,16 @@ def _post_api_appengine(path, payload, access_token=None):
     url = urljoin(SETTINGS['endpoint'], path)
     resp = AppEngineFetch(url,
                           method="POST",
-                          payload=payload,
+                          payload=payload_str,
                           headers=headers,
                           allow_truncated=False,
                           deadline=SETTINGS.get('timeout', DEFAULT_TIMEOUT),
                           validate_certificate=SETTINGS.get('verify_https', True))
 
-    return _parse_response(path, SETTINGS['access_token'], payload, resp)
+    return _parse_response(path, SETTINGS['access_token'], payload_str, resp)
 
 
-def _post_api(path, payload, access_token=None):
+def _post_api(path, payload_str, access_token=None):
     headers = {'Content-Type': 'application/json'}
 
     if access_token is not None:
@@ -1249,62 +1409,77 @@ def _post_api(path, payload, access_token=None):
 
     url = urljoin(SETTINGS['endpoint'], path)
     resp = transport.post(url,
-                          data=payload,
+                          data=payload_str,
                           headers=headers,
                           timeout=SETTINGS.get('timeout', DEFAULT_TIMEOUT),
-                          verify=SETTINGS.get('verify_https', True))
+                          verify=SETTINGS.get('verify_https', True),
+                          proxy=SETTINGS.get('http_proxy'),
+                          proxy_user=SETTINGS.get('http_proxy_user'),
+                          proxy_password=SETTINGS.get('http_proxy_password'))
 
-    return _parse_response(path, SETTINGS['access_token'], payload, resp)
+    return _parse_response(path, SETTINGS['access_token'], payload_str, resp)
 
 
 def _get_api(path, access_token=None, endpoint=None, **params):
     access_token = access_token or SETTINGS['access_token']
     url = urljoin(endpoint or SETTINGS['endpoint'], path)
     params['access_token'] = access_token
-    resp = transport.get(url, params=params, verify=SETTINGS.get('verify_https', True))
+    resp = transport.get(url,
+                         params=params,
+                         verify=SETTINGS.get('verify_https', True),
+                         proxy=SETTINGS.get('http_proxy'),
+                         proxy_user=SETTINGS.get('http_proxy_user'),
+                         proxy_password=SETTINGS.get('http_proxy_password'))
     return _parse_response(path, access_token, params, resp, endpoint=endpoint)
 
 
-def _send_payload_tornado(payload, access_token):
+def _send_payload_tornado(payload_str, access_token):
     try:
-        _post_api_tornado('item/', payload, access_token=access_token)
+        _post_api_tornado('item/', payload_str, access_token=access_token)
     except Exception as e:
         log.exception('Exception while posting item %r', e)
 
 
-@tornado_coroutine
-def _post_api_tornado(path, payload, access_token=None):
+def _post_api_tornado(path, payload_str, access_token=None):
     headers = {'Content-Type': 'application/json'}
 
     if access_token is not None:
         headers['X-Rollbar-Access-Token'] = access_token
+    else:
+        access_token = SETTINGS['access_token']
 
     url = urljoin(SETTINGS['endpoint'], path)
 
-    resp = yield TornadoAsyncHTTPClient().fetch(
-        url, body=payload, method='POST', connect_timeout=SETTINGS.get('timeout', DEFAULT_TIMEOUT),
-        request_timeout=SETTINGS.get('timeout', DEFAULT_TIMEOUT)
-    )
+    def post_tornado_cb(resp):
+        r = requests.Response()
+        r._content = resp.body
+        r.status_code = resp.code
+        r.headers.update(resp.headers)
+        try:
+            _parse_response(path, access_token, payload_str, r)
+        except Exception as e:
+            log.exception('Exception while posting item %r', e)
 
-    r = requests.Response()
-    r._content = resp.body
-    r.status_code = resp.code
-    r.headers.update(resp.headers)
+    TornadoAsyncHTTPClient().fetch(url,
+                                   callback=post_tornado_cb,
+                                   raise_error=False,
+                                   body=payload_str,
+                                   method='POST',
+                                   connect_timeout=SETTINGS.get('timeout', DEFAULT_TIMEOUT),
+                                   request_timeout=SETTINGS.get('timeout', DEFAULT_TIMEOUT))
 
-    _parse_response(path, SETTINGS['access_token'], payload, r)
 
-
-def _send_payload_twisted(payload, access_token):
+def _send_payload_twisted(payload_str, access_token):
     try:
-        _post_api_twisted('item/', payload, access_token=access_token)
+        _post_api_twisted('item/', payload_str, access_token=access_token)
     except Exception as e:
         log.exception('Exception while posting item %r', e)
 
 
-def _post_api_twisted(path, payload, access_token=None):
+def _post_api_twisted(path, payload_str, access_token=None):
     def post_data_cb(data, resp):
         resp._content = data
-        _parse_response(path, SETTINGS['access_token'], payload, resp)
+        _parse_response(path, SETTINGS['access_token'], payload_str, resp)
 
     def post_cb(resp):
         r = requests.Response()
@@ -1312,12 +1487,16 @@ def _post_api_twisted(path, payload, access_token=None):
         r.headers.update(resp.headers.getAllRawHeaders())
         return treq.content(resp).addCallback(post_data_cb, r)
 
-    headers = {'Content-Type': ['application/json']}
+    headers = {'Content-Type': ['application/json; charset=utf-8']}
     if access_token is not None:
         headers['X-Rollbar-Access-Token'] = [access_token]
 
     url = urljoin(SETTINGS['endpoint'], path)
-    d = treq.post(url, payload, headers=headers,
+    try:
+        encoded_payload = payload_str.encode('utf8')
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        encoded_payload = payload_str
+    d = treq.post(url, encoded_payload, headers=headers,
                   timeout=SETTINGS.get('timeout', DEFAULT_TIMEOUT))
     d.addCallback(post_cb)
 
@@ -1361,8 +1540,16 @@ def _parse_response(path, access_token, params, resp, endpoint=None):
     else:
         data = resp.content
 
+    global _LAST_RESPONSE_STATUS
+    last_response_was_429 = _LAST_RESPONSE_STATUS == 429
+    _LAST_RESPONSE_STATUS = resp.status_code
+
     if resp.status_code == 429:
-        log.warning("Rollbar: over rate limit, data was dropped. Payload was: %r", params)
+        if SETTINGS['log_all_rate_limited_items'] or not last_response_was_429:
+            log.warning("Rollbar: over rate limit, data was dropped. Payload was: %r", params)
+        return
+    elif resp.status_code == 502:
+        log.exception('Rollbar api returned a 502')
         return
     elif resp.status_code == 413:
         uuid = None
@@ -1379,9 +1566,11 @@ def _parse_response(path, access_token, params, resp, endpoint=None):
             log.exception('Unable to find payload parameters for failsafe.')
 
         _send_failsafe('payload too large', uuid, host)
+        # TODO: Should we return here?
     elif resp.status_code != 200:
         log.warning("Got unexpected status code from Rollbar api: %s\nResponse:\n%s",
                     resp.status_code, data)
+        # TODO: Should we also return here?
 
     try:
         json_data = json.loads(data)
